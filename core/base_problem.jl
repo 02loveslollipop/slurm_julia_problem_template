@@ -90,21 +90,31 @@ function _try_set_attribute(model, attr, value)
     end
 end
 
-function solve!(p::LPProblem; solver = nothing, msg = false,
-                time_limit = nothing, gap_rel = nothing, threads = nothing)
-    """Build and solve the problem, storing timing on p. Returns the model."""
-    model = build(p)
-    @info "Problem defined: $(nameof(typeof(p))) with params=$(p.params)"
+function solve_model!(model; solver = nothing, msg = false,
+                      time_limit = nothing, gap_rel = nothing, threads = nothing)
+    """Set the optimizer, apply limits, optimize!, and return elapsed seconds.
+
+    Shared by solve!() and by sub-problem workers (e.g. segments), so every
+    model in the project gets the same solver strategy and limits.
+    """
     factory = solver === nothing ?
               default_solver(msg = msg, time_limit = time_limit, gap_rel = gap_rel, threads = threads) :
               solver
-    @debug "Solving with $factory (msg=$msg, time_limit=$time_limit, gap_rel=$gap_rel, threads=$threads)"
     set_optimizer(model, factory)
     _try_set_attribute(model, MOI.TimeLimitSec(), time_limit)
     _try_set_attribute(model, MOI.RelativeGapTolerance(), gap_rel)
     _try_set_attribute(model, MOI.NumberOfThreads(), threads)
     _try_set_attribute(model, MOI.Silent(), !msg)
-    elapsed = @elapsed optimize!(model)
+    return @elapsed optimize!(model)
+end
+
+function solve!(p::LPProblem; solver = nothing, msg = false,
+                time_limit = nothing, gap_rel = nothing, threads = nothing)
+    """Build and solve the problem, storing timing on p. Returns the model."""
+    model = build(p)
+    @info "Problem defined: $(nameof(typeof(p))) with params=$(p.params)"
+    elapsed = solve_model!(model; solver = solver, msg = msg, time_limit = time_limit,
+                           gap_rel = gap_rel, threads = threads)
     p.model = model
     p.solve_time_s = elapsed
     @debug "Solve finished: status=$(termination_status(model)), objective=$(objective_value(model)), time=$(elapsed)s"

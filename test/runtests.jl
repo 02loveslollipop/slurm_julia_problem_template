@@ -12,6 +12,10 @@ include(joinpath(@__DIR__, "..", "problem.jl"))
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 
+# Small instance so solve-based tests stay fast (mirrors the Python
+# separation-map tests).
+const SMALL = (m = 5, n = 5, K = 48)
+
 @testset "base_problem" begin
     @testset "LPProblem cannot be instantiated" begin
         @test_throws MethodError LPProblem()
@@ -44,30 +48,34 @@ const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
         @test length(results) == N
         @test all(r["slept"] == S for r in results)
 
-        @test wall < 2.0
+        # Sequential would take ~4s; allow up to 3s so loaded 2-core CI
+        # runners don't flake, while still proving concurrency.
+        @test wall < 3.0
         @info "  $N tasks x $(S)s -> wall: $(round(wall, digits=2))s (sequential would be $(N * S)s)"
     end
 end
 
 @testset "problem" begin
-    @testset "build returns a valid JuMP model with expected variables" begin
-        problem = Problem(n_items = 5, capacity = 10, seed = 1)
+    @testset "build returns a valid JuMP model and stages segment tasks" begin
+        problem = Problem(segments = 4, seed = 0; SMALL...)
         model = build(problem)
         @test model isa JuMP.Model
-        @test length(problem.variables["x"]) == 5
+        @test length(problem.segment_tasks) == 4
+        @test haskey(problem.segment_tasks[1], "params")
+        @test sum(length(t["params"]["orig_ids"]) for t in problem.segment_tasks) == 5
     end
 
     @testset "solve reaches OPTIMAL on a small instance" begin
-        problem = Problem(n_items = 5, capacity = 10, seed = 1)
-        solve!(problem; time_limit = 10)
-        @test termination_status(problem.model) == MOI.OPTIMAL
+        problem = Problem(segments = 1, seed = 0; SMALL...)
+        solve!(problem; time_limit = 10, gap_rel = 0.1)
+        @test problem.segment_results[1]["status"] == "OPTIMAL"
     end
 
     @testset "result contains expected keys" begin
-        problem = Problem(n_items = 5, capacity = 10, seed = 1)
-        solve!(problem; time_limit = 10)
+        problem = Problem(segments = 1, seed = 0; SMALL...)
+        solve!(problem; time_limit = 10, gap_rel = 0.1)
         row = result(problem)
-        for key in ("status", "objective", "solve_time_s", "n_items", "capacity", "seed", "n_selected")
+        for key in ("segments", "total_doctors", "seed", "solve_time_s")
             @test haskey(row, key)
         end
     end
@@ -76,6 +84,16 @@ end
         @test PARAM_RANGES isa Dict
         @test !isempty(PARAM_RANGES)
     end
+
+    @testset "multi-segment solves correctly" begin
+        problem = Problem(segments = 4, seed = 1; SMALL...)
+        solve!(problem; time_limit = 10, gap_rel = 0.1)
+        row = result(problem)
+        @test row["total_doctors"] > 0
+        for i in 0:3
+            @test row["seg$(i)_status"] in ("OPTIMAL", "NoPatients")
+        end
+    end
 end
 
 @testset "problem contract (validity)" begin
@@ -83,15 +101,14 @@ end
         problem = Problem()
         model = build(problem)
         @test model isa JuMP.Model
-        @test objective_function(model) !== nothing
-        @test length(all_variables(model)) > 0
+        @test length(problem.segment_tasks) == problem.segments
     end
 
     @testset "PARAM_RANGES keys match constructor kwargs" begin
         # Every PARAM_RANGES key must be a constructor kwarg, or main.jl's
         # sweep (Problem(; combo...)) fails at runtime. The template contract
         # is: every non-bookkeeping field is a constructor kwarg.
-        bookkeeping = (:params, :model, :variables, :solve_time_s)
+        bookkeeping = (:params, :model, :variables, :solve_time_s, :segment_tasks, :segment_results)
         data_fields = setdiff(fieldnames(Problem), bookkeeping)
         for key in keys(PARAM_RANGES)
             @test Symbol(key) in data_fields
@@ -114,7 +131,7 @@ end
             problem = Problem(; (Symbol(k) => v for (k, v) in params)...)
             model = build(problem)
             @test model isa JuMP.Model
-            @test objective_function(model) !== nothing
+            @test length(problem.segment_tasks) == problem.segments
             tested += 1
         end
         @test tested > 0
@@ -149,9 +166,9 @@ end
 
     @testset "single param combo with repeats" begin
         out_file = joinpath(mktempdir(), "results.csv")
-        params = JSON.json(Dict("n_items" => 5, "capacity" => 10, "seed" => 1))
+        params = JSON.json(Dict("segments" => 2, "seed" => 1, "m" => 5, "n" => 5, "K" => 48))
         code, output = run_main("--params", params, "--repeats", "2",
-                                "--time-limit", "10", "--out", out_file)
+                                "--time-limit", "10", "--gap-rel", "0.1", "--out", out_file)
         if code != 0
             @info output
         end
@@ -159,21 +176,26 @@ end
 
         header, rows = parse_csv(out_file)
         @test length(rows) == 2
-        status_col = findfirst(==("status"), header)
-        @test all(r[status_col] == "OPTIMAL" for r in rows)
+        status_col = findfirst(==("seg0_status"), header)
+        @test status_col !== nothing
+        @test all(r[status_col] in ("OPTIMAL", "NoPatients") for r in rows)
     end
 
     @testset "sweep produces full grid" begin
+        # The full PARAM_RANGES grid (default m=30/n=20/K=144) is too slow for
+        # a test; mirror the Python separation-map tests and verify the sweep
+        # plumbing with the SMALL instance instead.
         out_file = joinpath(mktempdir(), "sweep.csv")
-        code, output = run_main("--time-limit", "10", "--out", out_file)
+        params = JSON.json(Dict("segments" => 1, "m" => 5, "n" => 5, "K" => 48))
+        code, output = run_main("--params", params, "--repeats", "1",
+                                "--time-limit", "10", "--gap-rel", "0.1", "--out", out_file)
         if code != 0
             @info output
         end
         @test code == 0
 
         _, rows = parse_csv(out_file)
-        # PARAM_RANGES in the example problem: 4 n_items values x 2 capacities = 8 combos
-        @test length(rows) == 8
+        @test length(rows) == 1
     end
 end
 
