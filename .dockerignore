@@ -1,0 +1,6 @@
+.git/
+.github/
+.env
+Manifest.toml
+results.csv
+*.csv

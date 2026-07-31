@@ -1,0 +1,44 @@
+name: package
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy
+          cp problem.jl main.jl Project.toml run_job.sh deploy/
+          cp -r core deploy/
+          cd deploy
+          zip -r ../julia_problem.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: julia_problem
+          path: julia_problem.zip
+
+      - name: Create Release (public wget URL)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: package-${{ github.run_id }}
+          name: "Package ${{ github.run_id }}"
+          body: |
+            Deployment package for Julia problems.
+
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/package-${{ github.run_id }}/julia_problem.zip
+            unzip julia_problem.zip && bash run_job.sh
+            ```
+          files: julia_problem.zip
+          fail_on_unmatched_files: false
+          generate_release_notes: false
