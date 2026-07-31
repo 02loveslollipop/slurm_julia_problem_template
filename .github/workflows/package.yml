@@ -11,7 +11,7 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Create deployment package
         run: |
@@ -22,13 +22,13 @@ jobs:
           zip -r ../julia_problem.zip .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: julia_problem
           path: julia_problem.zip
 
       - name: Create Release (public wget URL)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: package-${{ github.run_id }}
           name: "Package ${{ github.run_id }}"
