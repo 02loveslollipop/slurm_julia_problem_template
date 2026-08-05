@@ -22,7 +22,8 @@ jobs:
       - uses: julia-actions/cache@v3
 
       - name: Install dependencies
-        run: julia --project=. -e 'using Pkg; try Pkg.instantiate() catch; rm("Manifest.toml", force=true); Pkg.resolve(); Pkg.instantiate() end'
+        run: |
+          julia --project=. -e 'using Pkg; try Pkg.instantiate() catch; exit(1) end' || { rm -f Manifest.toml; julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'; }
 
       - name: Run tests
         run: julia --project=. -e 'using Pkg; Pkg.test()'
