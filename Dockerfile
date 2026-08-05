@@ -16,6 +16,7 @@ RUN curl -fsSL https://packages.gurobi.com/13.0/gurobi${GUROBI_VERSION}_linux64.
 ENV GUROBI_HOME=/opt/gurobi1302/linux64
 
 COPY Project.toml .
+COPY src src
 RUN julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 COPY . .

@@ -39,16 +39,26 @@ end
 function _gurobi_env_params()
     """WLS license credentials from GRB_* env vars, as Gurobi Env params."""
     params = Dict{String,Any}()
-    haskey(ENV, "GRB_WLSACCESSID") && (params["WLSACCESSID"] = ENV["GRB_WLSACCESSID"])
-    haskey(ENV, "GRB_WLSSECRET") && (params["WLSSECRET"] = ENV["GRB_WLSSECRET"])
-    haskey(ENV, "GRB_LICENSEID") && (params["LICENSEID"] = parse(Int, ENV["GRB_LICENSEID"]))
+    wls_id = strip(get(ENV, "GRB_WLSACCESSID", ""))
+    wls_sec = strip(get(ENV, "GRB_WLSSECRET", ""))
+    lic_str = strip(get(ENV, "GRB_LICENSEID", ""))
+
+    !isempty(wls_id) && (params["WLSACCESSID"] = wls_id)
+    !isempty(wls_sec) && (params["WLSSECRET"] = wls_sec)
+    if !isempty(lic_str)
+        lic_id = tryparse(Int, lic_str)
+        lic_id !== nothing && (params["LICENSEID"] = lic_id)
+    end
     return params
 end
 
 function _gurobi_license_present()
     """True if Gurobi has real license credentials configured (WLS env vars
     or a license file), as opposed to a size-limited trial license."""
-    !isempty(_gurobi_env_params()) && return true
+    params = _gurobi_env_params()
+    if haskey(params, "WLSACCESSID") && haskey(params, "WLSSECRET") && haskey(params, "LICENSEID")
+        return true
+    end
     lic_file = get(ENV, "GRB_LICENSE_FILE", "")
     candidates = String[
         lic_file,
