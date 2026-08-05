@@ -15,10 +15,6 @@ include(joinpath(@__DIR__, "..", "problem.jl"))
 
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, ".."))
 
-# Small instance so solve-based tests stay fast (mirrors the Python
-# separation-map tests).
-const SMALL = (m = 5, n = 5, K = 48)
-
 @testset "base_problem" begin
     @testset "LPProblem cannot be instantiated" begin
         @test_throws MethodError LPProblem()
@@ -100,7 +96,7 @@ end
         db = init_sqlite_db(db_file)
         @test isfile(db_file)
 
-        row = Dict{String,Any}("segments" => 1, "seed" => 0, "status" => "OPTIMAL", "total_doctors" => 5, "solve_time_s" => 0.12)
+        row = Dict{String,Any}("scale" => 1.0, "seed" => 0, "status" => "OPTIMAL", "solve_time_s" => 0.12)
         write_sqlite_row(db, 0, 0, row)
 
         res = DBInterface.execute(db, "SELECT rank, rep, status, solve_time_s FROM results;") |> Tables.columntable
@@ -132,81 +128,40 @@ end
     end
 end
 
-@testset "problem" begin
-    @testset "build returns a valid JuMP model and stages segment tasks" begin
-        problem = Problem(segments = 4, seed = 0; SMALL...)
-        model = build(problem)
-        @test model isa JuMP.Model
-        @test length(problem.segment_tasks) == 4
-        @test haskey(problem.segment_tasks[1], "params")
-        @test sum(length(t["params"]["orig_ids"]) for t in problem.segment_tasks) == 5
-    end
-
-    @testset "solve reaches OPTIMAL on a small instance" begin
-        problem = Problem(segments = 1, seed = 0; SMALL...)
-        solve!(problem; time_limit = 10, gap_rel = 0.1)
-        @test problem.segment_results[1]["status"] == "OPTIMAL"
-    end
-
-    @testset "result contains expected keys" begin
-        problem = Problem(segments = 1, seed = 0; SMALL...)
-        solve!(problem; time_limit = 10, gap_rel = 0.1)
-        row = result(problem)
-        for key in ("segments", "total_doctors", "seed", "solve_time_s")
-            @test haskey(row, key)
-        end
-    end
-
-    @testset "PARAM_RANGES declared for sweeps" begin
-        @test PARAM_RANGES isa Dict
-        @test !isempty(PARAM_RANGES)
-    end
-
-    @testset "multi-segment solves correctly" begin
-        problem = Problem(segments = 4, seed = 1; SMALL...)
-        solve!(problem; time_limit = 10, gap_rel = 0.1)
-        row = result(problem)
-        @test row["total_doctors"] > 0
-        for i in 0:3
-            @test row["seg$(i)_status"] in ("OPTIMAL", "NoPatients")
-        end
-    end
+@testset "starter shell problem.jl" begin
+    p = Problem()
+    m = build(p)
+    @test m isa JuMP.Model
+    solve!(p; time_limit = 5.0)
+    r = result(p)
+    @test r["status"] == "OPTIMAL"
+    @test haskey(r, "x_val") && haskey(r, "y_val")
+    @test PARAM_RANGES isa Dict
+    @test !isempty(PARAM_RANGES)
 end
 
-@testset "problem contract (validity)" begin
-    @testset "compiles with default params" begin
-        problem = Problem()
-        model = build(problem)
-        @test model isa JuMP.Model
-        @test length(problem.segment_tasks) == problem.segments
-    end
+@testset "examples contract" begin
+    example_dir = joinpath(PROJECT_ROOT, "examples")
+    example_files = sort([f for f in readdir(example_dir) if endswith(f, ".jl")])
+    @test length(example_files) == 7
 
-    @testset "PARAM_RANGES keys match constructor kwargs" begin
-        bookkeeping = (:params, :model, :variables, :solve_time_s, :segment_tasks, :segment_results)
-        data_fields = setdiff(fieldnames(Problem), bookkeeping)
-        for key in keys(PARAM_RANGES)
-            @test Symbol(key) in data_fields
+    for (i, ex_file) in enumerate(example_files)
+        full_path = joinpath(example_dir, ex_file)
+        @testset "$ex_file" begin
+            mod = Core.eval(Main, :(module $(Symbol("Ex_$i")) end))
+            Base.include(mod, full_path)
+            @test isdefined(mod, :Problem)
+            @test isdefined(mod, :PARAM_RANGES)
+            
+            prob = mod.Problem()
+            m = mod.build(prob)
+            @test m isa JuMP.Model
+            
+            mod.solve!(prob; time_limit = 5.0, gap_rel = 0.1)
+            r = mod.result(prob)
+            @test r isa Dict
+            @test haskey(r, "solve_time_s")
         end
-    end
-
-    @testset "PARAM_RANGES values are non-empty" begin
-        for (key, values) in PARAM_RANGES
-            @test length(values) > 0
-        end
-    end
-
-    @testset "every param combination compiles" begin
-        rkeys = collect(keys(PARAM_RANGES))
-        tested = 0
-        for combo in Iterators.take(Iterators.product((PARAM_RANGES[k] for k in rkeys)...), 20)
-            params = Dict{String,Any}(k => v for (k, v) in zip(rkeys, combo))
-            problem = Problem(; (Symbol(k) => v for (k, v) in params)...)
-            model = build(problem)
-            @test model isa JuMP.Model
-            @test length(problem.segment_tasks) == problem.segments
-            tested += 1
-        end
-        @test tested > 0
     end
 end
 
@@ -228,8 +183,8 @@ end
 
     @testset "range partitioning with SQLite output" begin
         db_file = joinpath(mktempdir(), "range_test.db")
-        params = JSON.json(Dict("segments" => 1, "m" => 5, "n" => 5, "K" => 48))
-        code, output = run_main("--params", params, "--range", "1:2", "--format", "sqlite",
+        params = JSON.json(Dict("scale" => 1.0, "seed" => 0))
+        code, output = run_main("--params", params, "--range", "1:1", "--format", "sqlite",
                                 "--time-limit", "10", "--gap-rel", "0.1", "--out", db_file)
         if code != 0
             @info output
@@ -245,7 +200,7 @@ end
     @testset "rank partitioning with JSON output" begin
         json_file1 = joinpath(mktempdir(), "rank0.json")
         json_file2 = joinpath(mktempdir(), "rank1.json")
-        params = JSON.json(Dict("segments" => 1, "m" => 5, "n" => 5, "K" => 48))
+        params = JSON.json(Dict("scale" => 2.0, "seed" => 1))
 
         code1, out1 = run_main("--params", params, "--rank", "0", "--num-ranks", "2", "--format", "json",
                                "--time-limit", "10", "--gap-rel", "0.1", "--out", json_file1)
@@ -265,7 +220,7 @@ end
 
     @testset "CSV format output" begin
         csv_file = joinpath(mktempdir(), "results.csv")
-        params = JSON.json(Dict("segments" => 1, "m" => 5, "n" => 5, "K" => 48))
+        params = JSON.json(Dict("scale" => 1.0, "seed" => 0))
         code, output = run_main("--params", params, "--format", "csv",
                                 "--time-limit", "10", "--gap-rel", "0.1", "--out", csv_file)
         @test code == 0
