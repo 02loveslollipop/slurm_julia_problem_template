@@ -16,7 +16,7 @@ jobs:
       - name: Create deployment package
         run: |
           mkdir -p deploy
-          cp problem.jl main.jl Project.toml run_job.sh deploy/
+          cp problem.jl main.jl Project.toml Manifest.toml run_job.sh deploy/
           cp -r core src deploy/
           cd deploy
           zip -r ../julia_problem.zip .

@@ -15,7 +15,9 @@ RUN curl -fsSL https://packages.gurobi.com/13.0/gurobi${GUROBI_VERSION}_linux64.
  && rm /tmp/gurobi.tar.gz
 ENV GUROBI_HOME=/opt/gurobi1302/linux64
 
-COPY Project.toml .
+RUN apt-get update && apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev && rm -rf /var/lib/apt/lists/*
+
+COPY Project.toml Manifest.toml .
 COPY src src
 RUN julia --project=. -e 'using Pkg; Pkg.instantiate()'
 

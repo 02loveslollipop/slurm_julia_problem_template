@@ -7,14 +7,13 @@
 # exported by problem.jl, so it stays correct across any problem you plug in.
 #
 # Usage:
-#     julia --project=. main.jl                            # sweep PARAM_RANGES
-#     julia --project=. main.jl --params '{"n_items": 8, "capacity": 30}' --repeats 5
+#     julia --project=. main.jl                                     # sweep PARAM_RANGES
+#     julia --project=. main.jl --range 1:10                        # range of combinations
+#     julia --project=. main.jl --rank 0 --num-ranks 4              # rank partitioning
+#     julia --project=. main.jl --format sqlite --out results.db    # SQLite output
+#     julia --project=. main.jl --params '{"n_items": 8}' --repeats 5
 #     julia --project=. main.jl --time-limit 30 --gap-rel 0.01 --threads 4
 #
-# Repeats re-solve the same parameter combination multiple times (useful to
-# measure solve-time variance). If your problem is randomized via a seed
-# constructor kwarg, include "seed" in PARAM_RANGES yourself to sweep over
-# distinct random instances instead.
 using JSON
 
 include("core/base_problem.jl")
@@ -29,6 +28,11 @@ mutable struct CliArgs
     log::String
     msg::Bool
     out::String
+    range::Union{Nothing,UnitRange{Int}}
+    rank::Union{Nothing,Int}
+    num_ranks::Union{Nothing,Int}
+    use_mpi::Bool
+    format::String
 end
 
 const HELP = """
@@ -36,19 +40,32 @@ Usage:
     julia --project=. main.jl [options]
 
 Options:
-    --params JSON      JSON dict for a single run, overrides the PARAM_RANGES
-                       sweep, e.g. '{"n_items": 8, "capacity": 30}'
-    --repeats N        Repetitions per parameter combination (default: 1)
-    --time-limit S     Solver time limit (seconds)
-    --gap-rel F        Solver relative MIP gap
-    --threads N        Solver thread count
-    --log LEVEL        info (default), debug, or silent
-    --msg              Show solver output
-    --out PATH         Output CSV path (default: results.csv)
+    --params JSON       JSON dict for a single run, overrides the PARAM_RANGES
+                        sweep, e.g. '{"n_items": 8, "capacity": 30}'
+    --repeats N         Repetitions per parameter combination (default: 1)
+    --time-limit S      Solver time limit (seconds)
+    --gap-rel F         Solver relative MIP gap
+    --threads N         Solver thread count
+    --log LEVEL         info (default), debug, or silent
+    --msg               Show solver output
+    --range START:END   1-indexed range of parameter combinations (e.g. 1:10)
+    --rank R            0-indexed rank of this worker node
+    --num-ranks N       Total number of worker nodes
+    --use-mpi           Enable MPI execution mode via MPI.jl
+    --format FORMAT     Output format: sqlite (default), json, jsonl, or csv
+    --out PATH          Output path (default: results.db or results.json)
 """
 
+function parse_range(str::String)
+    parts = split(replace(str, "-" => ":"), ":")
+    length(parts) == 2 || error("Invalid range format '$str', expected START:END")
+    s = parse(Int, parts[1])
+    e = parse(Int, parts[2])
+    return s:e
+end
+
 function parse_args(args)
-    cli = CliArgs(nothing, 1, nothing, nothing, nothing, "info", false, "results.csv")
+    cli = CliArgs(nothing, 1, nothing, nothing, nothing, "info", false, "results.db", nothing, nothing, nothing, false, "sqlite")
     i = 1
     while i <= length(args)
         arg = args[i]
@@ -68,6 +85,18 @@ function parse_args(args)
             cli.log = level; i += 2
         elseif arg == "--msg"
             cli.msg = true; i += 1
+        elseif arg == "--range"
+            cli.range = parse_range(args[i + 1]); i += 2
+        elseif arg == "--rank"
+            cli.rank = parse(Int, args[i + 1]); i += 2
+        elseif arg == "--num-ranks"
+            cli.num_ranks = parse(Int, args[i + 1]); i += 2
+        elseif arg == "--use-mpi"
+            cli.use_mpi = true; i += 1
+        elseif arg == "--format"
+            fmt = lowercase(args[i + 1])
+            fmt in ("sqlite", "json", "jsonl", "csv") || error("--format must be one of: sqlite, json, jsonl, csv")
+            cli.format = fmt; i += 2
         elseif arg == "--out"
             cli.out = args[i + 1]; i += 2
         elseif arg in ("-h", "--help")
@@ -77,6 +106,17 @@ function parse_args(args)
             error("Unknown argument: $arg")
         end
     end
+
+    if cli.out == "results.db" && cli.format != "sqlite"
+        if cli.format == "json"
+            cli.out = "results.json"
+        elseif cli.format == "jsonl"
+            cli.out = "results.jsonl"
+        elseif cli.format == "csv"
+            cli.out = "results.csv"
+        end
+    end
+
     return cli
 end
 
@@ -84,7 +124,7 @@ function param_combinations(params_override)
     params_override !== nothing && return [params_override]
     ranges = PARAM_RANGES
     isempty(ranges) && return [Dict{String,Any}()]
-    rkeys = collect(keys(ranges))
+    rkeys = sort(collect(keys(ranges)))
     combos = Dict{String,Any}[]
     for combo in Iterators.product((ranges[k] for k in rkeys)...)
         push!(combos, Dict{String,Any}(k => v for (k, v) in zip(rkeys, combo)))
@@ -112,21 +152,67 @@ function main(args = ARGS)
     silent = cli.log == "silent"
     rows = Dict{String,Any}[]
 
-    for combo in param_combinations(cli.params)
+    rank = 0
+    num_ranks = 1
+
+    if cli.use_mpi
+        comm, rank, num_ranks = init_mpi_context()
+        silent || @info "MPI initialized: rank $rank/$num_ranks"
+    elseif cli.rank !== nothing && cli.num_ranks !== nothing
+        rank = cli.rank
+        num_ranks = cli.num_ranks
+    else
+        rank, num_ranks, env_name = detect_environment_rank()
+        if env_name != "standalone"
+            silent || @info "Auto-detected rank $rank/$num_ranks from $env_name"
+        end
+    end
+
+    combos = Dict{String,Any}[]
+    if cli.params !== nothing
+        combos = [cli.params]
+    elseif cli.range !== nothing
+        N_total = total_combinations(PARAM_RANGES)
+        r_start = max(1, first(cli.range))
+        r_end = min(N_total, last(cli.range))
+        combos = [combo_at(PARAM_RANGES, idx) for idx in r_start:r_end]
+    elseif num_ranks > 1
+        N_total = total_combinations(PARAM_RANGES)
+        assigned_range = partition_range(N_total, rank, num_ranks)
+        combos = [combo_at(PARAM_RANGES, idx) for idx in assigned_range]
+    else
+        combos = param_combinations(nothing)
+    end
+
+    db = cli.format == "sqlite" ? init_sqlite_db(cli.out) : nothing
+
+    for combo in combos
         for rep in 1:cli.repeats
             problem = Problem(; (Symbol(k) => v for (k, v) in combo)...)
             solve!(problem; msg = cli.msg, time_limit = cli.time_limit,
                    gap_rel = cli.gap_rel, threads = cli.threads)
             row = result(problem)
             row["rep"] = rep - 1
+            row["rank"] = rank
             push!(rows, row)
+
+            if db !== nothing
+                write_sqlite_row(db, rank, rep - 1, row)
+            end
             silent || @info JSON.json(row)
         end
     end
 
     if !isempty(rows)
-        write_csv(cli.out, rows, sort!(collect(keys(rows[1]))))
-        silent || @info "Wrote $(length(rows)) rows to $(cli.out)"
+        summary = compute_summary(rows)
+        if cli.format == "json"
+            write_json_results(cli.out, rows, summary)
+        elseif cli.format == "jsonl"
+            write_jsonl_results(cli.out, rows)
+        elseif cli.format == "csv"
+            write_csv(cli.out, rows, sort!(collect(keys(rows[1]))))
+        end
+        silent || @info "Wrote $(length(rows)) rows to $(cli.out) (format: $(cli.format))"
     end
 end
 

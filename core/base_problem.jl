@@ -5,9 +5,15 @@
 # problem via problem.jl.
 using JuMP
 using Logging
+using SQLite
+using Tables
 import Gurobi
 import HiGHS
+import MPI
 import MathOptInterface as MOI
+import Dates
+import DBInterface
+import JSON
 
 """
     abstract type LPProblem end
@@ -210,4 +216,181 @@ function solve_subproblems_parallel(subproblem_tasks; n_workers = nothing)
         results[i] = r
     end
     return results
+end
+
+"""
+    total_combinations(ranges::Dict{String,Any})
+
+Returns total count of parameter combinations in ranges grid.
+"""
+function total_combinations(ranges::Dict{String,Any})
+    isempty(ranges) && return 1
+    return prod(length(v) for v in values(ranges))
+end
+
+"""
+    combo_at(ranges::Dict{String,Any}, idx::Int)
+
+Calculate 1-indexed 1D permutation `idx` (1..N_total) directly to a parameter Dict.
+"""
+function combo_at(ranges::Dict{String,Any}, idx::Int)
+    isempty(ranges) && return Dict{String,Any}()
+    rkeys = sort(collect(keys(ranges)))
+    dims = Tuple(length(ranges[k]) for k in rkeys)
+    N_total = prod(dims)
+    (1 <= idx <= N_total) || error("Index $idx out of bounds (1..$N_total)")
+    
+    ci = CartesianIndices(dims)[idx]
+    combo = Dict{String,Any}()
+    for (d, k) in enumerate(rkeys)
+        combo[k] = ranges[k][ci[d]]
+    end
+    return combo
+end
+
+"""
+    partition_range(total_len::Int, rank::Int, num_ranks::Int)
+
+Computes 1-indexed contiguous block `start_idx:end_idx` for 0-indexed rank.
+"""
+function partition_range(total_len::Int, rank::Int, num_ranks::Int)
+    (total_len <= 0 || num_ranks <= 0) && return 1:0
+    num_ranks == 1 && return 1:total_len
+    
+    items_per_rank = ceil(Int, total_len / num_ranks)
+    start_idx = rank * items_per_rank + 1
+    end_idx = min((rank + 1) * items_per_rank, total_len)
+    
+    start_idx > end_idx ? (1:0) : (start_idx:end_idx)
+end
+
+"""
+    detect_environment_rank()
+
+Detect rank and size from HPC environment variables (Slurm, OpenMPI, PMI).
+Returns `(rank, num_ranks, source_name)`.
+"""
+function detect_environment_rank()
+    env_pairs = [
+        ("SLURM_PROCID", "SLURM_NTASKS", "Slurm"),
+        ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE", "OpenMPI"),
+        ("PMI_RANK", "PMI_SIZE", "PMI"),
+        ("MPI_RANK", "MPI_SIZE", "MPI"),
+    ]
+    for (r_var, n_var, name) in env_pairs
+        if haskey(ENV, r_var) && haskey(ENV, n_var)
+            r = tryparse(Int, ENV[r_var])
+            n = tryparse(Int, ENV[n_var])
+            if r !== nothing && n !== nothing && n > 0
+                return (r, n, name)
+            end
+        end
+    end
+    return (0, 1, "standalone")
+end
+
+"""
+    init_mpi_context()
+
+Initializes MPI if not already initialized and returns `(comm, rank, size)`.
+"""
+function init_mpi_context()
+    if !MPI.Initialized()
+        MPI.Init()
+    end
+    comm = MPI.COMM_WORLD
+    return comm, MPI.Comm_rank(comm), MPI.Comm_size(comm)
+end
+
+"""
+    init_sqlite_db(path::String)
+
+Initializes SQLite database with WAL mode and creates results table.
+"""
+function init_sqlite_db(path::String)
+    db = SQLite.DB(path)
+    SQLite.execute(db, "PRAGMA journal_mode=WAL;")
+    SQLite.execute(db, "PRAGMA busy_timeout=5000;")
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rank INTEGER,
+            rep INTEGER,
+            params TEXT,
+            status TEXT,
+            objective TEXT,
+            solve_time_s REAL,
+            timestamp TEXT,
+            details TEXT
+        );
+    """)
+    return db
+end
+
+"""
+    write_sqlite_row(db, rank::Int, rep::Int, row::Dict{String,Any})
+
+Writes a single result row into SQLite DB.
+"""
+function write_sqlite_row(db, rank::Int, rep::Int, row::Dict{String,Any})
+    status = string(get(row, "status", get(row, "seg0_status", "UNKNOWN")))
+    obj = string(get(row, "objective", get(row, "total_doctors", "NA")))
+    solve_time = Float64(get(row, "solve_time_s", 0.0))
+    params_json = JSON.json(row)
+    ts = string(Dates.now())
+    
+    DBInterface.execute(db, """
+        INSERT INTO results (rank, rep, params, status, objective, solve_time_s, timestamp, details)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+    """, (rank, rep, params_json, status, obj, solve_time, ts, params_json))
+end
+
+"""
+    compute_summary(rows::Vector{Dict{String,Any}})
+
+Compute summary statistics for a set of result rows.
+"""
+function compute_summary(rows::Vector{Dict{String,Any}})
+    total = length(rows)
+    total == 0 && return Dict{String,Any}("total_runs" => 0)
+    
+    solve_times = [Float64(get(r, "solve_time_s", 0.0)) for r in rows]
+    successful = count(r -> get(r, "status", "") == "OPTIMAL" || get(r, "seg0_status", "") == "OPTIMAL", rows)
+    
+    return Dict{String,Any}(
+        "total_runs" => total,
+        "successful_runs" => successful,
+        "success_rate" => round(successful / total, digits=4),
+        "min_solve_time_s" => minimum(solve_times),
+        "max_solve_time_s" => maximum(solve_times),
+        "avg_solve_time_s" => round(sum(solve_times) / total, digits=4),
+    )
+end
+
+"""
+    write_json_results(path::String, rows::Vector{Dict{String,Any}}, summary::Dict{String,Any})
+
+Writes rows and summary metadata to a JSON file.
+"""
+function write_json_results(path::String, rows::Vector{Dict{String,Any}}, summary::Dict{String,Any})
+    data = Dict{String,Any}(
+        "summary" => summary,
+        "results" => rows
+    )
+    open(path, "w") do io
+        write(io, JSON.json(data, 2))
+    end
+end
+
+"""
+    write_jsonl_results(path::String, rows::Vector{Dict{String,Any}})
+
+Writes rows to a JSON Lines file.
+"""
+function write_jsonl_results(path::String, rows::Vector{Dict{String,Any}})
+    open(path, "w") do io
+        for r in rows
+            println(io, JSON.json(r))
+        end
+    end
 end

@@ -1,9 +1,9 @@
 # Julia build artifacts
-Manifest.toml
-
 # Local Gurobi WLS credentials (never committed)
 .env
 
 # Outputs
 results.csv
 *.csv
+*.db
+*.json
